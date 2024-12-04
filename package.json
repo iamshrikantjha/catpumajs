@@ -13,6 +13,7 @@
     "@tensorflow/tfjs": "^4.22.0",
     "@tensorflow/tfjs-node": "^4.22.0",
     "axios": "^1.7.8",
+    "fs": "0.0.1-security",
     "mathjs": "^14.0.0",
     "moment": "^2.30.1"
   }

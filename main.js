@@ -1,96 +1,59 @@
-const axios = require("axios"); // For fetching data
-const moment = require("moment"); // For date manipulations
-const tf = require("@tensorflow/tfjs-node"); // TensorFlow.js for machine learning
+const tf = require("@tensorflow/tfjs-node");
+const axios = require("axios");
+const moment = require("moment");
 
-// Helper function to calculate the mean of an array segment
-function getMean(array, low, high, nullValue = 999) {
-  let avg = NaN;
-  while (isNaN(avg)) {
-    const segment = array.slice(low, high + 1).filter((value) => {
-      return parseInt(value) !== nullValue && !isNaN(parseFloat(value));
-    });
-    if (segment.length > 0) {
-      avg = segment.reduce((sum, value) => sum + parseFloat(value), 0) / segment.length;
-    } else {
-      avg = NaN;
-    }
-
-    if (isNaN(avg)) {
-      low -= 1;
-      high += 1;
-    }
-
-    if (high - low > 24) {
-      avg = 1e-5;
-    }
-  }
-  return parseFloat(avg.toFixed(5));
-}
-
-// Function to fetch solar wind data
-async function readOmni(time = "2015-04-04T16:32:00", duration = 6) {
-  const year = time.substring(0, 4);
-  const url = `https://spdf.gsfc.nasa.gov/pub/data/omni/low_res_omni/omni2_${year}.dat`;
-
+// Fetch and preprocess CME data from the provided URL
+async function fetchCMEData() {
+  const url = "https://cdaw.gsfc.nasa.gov/CME_list/UNIVERSAL_ver2/text_ver/univ2024_08.txt";
   try {
-    const response = await axios.get(url, { timeout: 30000 });
-    const data = response.data.split("\n").map((line) => line.trim().split(/\s+/));
-    const timeMoment = moment(time);
-    const doy = timeMoment.diff(moment(`${timeMoment.year()}-01-01`), "days");
-    let idx = doy * 24 + timeMoment.hour();
+    const response = await axios.get(url);
+    const lines = response.data.split("\n").filter((line) => line.trim() !== "");
 
-    const wind = {
-      Bz: getMean(data.map((row) => row[14]), idx, idx + duration),
-      Ratio: getMean(data.map((row) => row[27]), idx, idx + duration, 9),
-      V: getMean(data.map((row) => row[24]), idx, idx + duration, 9999),
-      Lat: getMean(data.map((row) => row[26]), idx, idx + duration),
-      P: getMean(data.map((row) => row[28]), idx, idx + duration, 99),
-      Lon: getMean(data.map((row) => row[25]), idx, idx + duration),
-      Bx: getMean(data.map((row) => row[12]), idx, idx + duration),
-      T: getMean(data.map((row) => row[22]), idx, idx + duration, 9999999),
+    const processedData = [];
+    const labels = [];
+
+    // Extract relevant fields: Linear Speed, Angular Width, Transit Time (if available)
+    for (const line of lines) {
+      const fields = line.trim().split(/\s+/); // Split line into fields
+      if (fields.length >= 7) {
+        const speed = parseFloat(fields[3]); // Linear Speed (km/s)
+        const width = parseFloat(fields[5]); // Angular Width (degrees)
+        const transitTime = parseFloat(fields[6]); // Transit Time (hours)
+
+        // Validate data before adding to processedData and labels
+        if (!isNaN(speed) && !isNaN(width) && !isNaN(transitTime) && transitTime > 0) {
+          processedData.push([speed, width]);
+          labels.push(transitTime);
+        }
+      }
+    }
+
+    // Check if processedData and labels are not empty
+    if (processedData.length === 0 || labels.length === 0) {
+      throw new Error("No valid data found in the CME file.");
+    }
+
+    console.log("Processed Data:", processedData);
+    console.log("Labels:", labels);
+
+    return {
+      features: tf.tensor2d(processedData),
+      labels: tf.tensor2d(labels, [labels.length, 1]),
     };
-
-    return wind;
   } catch (error) {
-    console.error("Error fetching solar wind data:", error.message);
-    return {};
+    console.error("Error fetching CME data:", error.message);
+    return { features: tf.tensor2d([], [0, 2]), labels: tf.tensor2d([], [0, 1]) }; // Return empty tensors if no data
   }
 }
 
-// Function to prepare the input for the SVM model
-function getSvmInput(info, features) {
-  const x = [];
-
-  // Map for CME and solar wind features
-  const featureMap = {
-    "CME Average Speed": info["Speed"],
-    "CME Final Speed": info["Speed_final"],
-    "CME Angular Width": info["Width"],
-    "CME Mass": info["Mass"],
-    "CME Position Angle": info["PA"],
-    "Solar Wind Bz": info.Wind["Bz"],
-    "Solar Wind Speed": info.Wind["V"],
-    "Solar Wind Temperature": info.Wind["T"],
-    "Solar Wind Pressure": info.Wind["P"],
-    "Solar Wind Longitude": info.Wind["Lon"],
-    "Solar Wind He Proton Ratio": info.Wind["Ratio"],
-    "Solar Wind Bx": info.Wind["Bx"],
-  };
-
-  // Ensure all features are included
-  features.forEach((feature) => {
-    if (featureMap[feature] !== undefined) {
-      x.push(parseFloat(featureMap[feature]));
-    } else {
-      x.push(0.0); // Default value for missing features
-    }
-  });
-
-  // Ensure the array has the correct shape
-  return tf.tensor2d([x]);
+// Normalize data
+function normalize(tensor) {
+  const min = tensor.min();
+  const max = tensor.max();
+  return tensor.sub(min).div(max.sub(min));
 }
 
-// Function to create and train a simple neural network model
+// Create and train the model
 async function createAndTrainModel(features, labels) {
   const model = tf.sequential();
   model.add(tf.layers.dense({ units: 64, activation: "relu", inputShape: [features.shape[1]] }));
@@ -98,7 +61,7 @@ async function createAndTrainModel(features, labels) {
   model.add(tf.layers.dense({ units: 1 })); // Single output
 
   model.compile({
-    optimizer: "adam",
+    optimizer: tf.train.adam(0.001),
     loss: "meanSquaredError",
     metrics: ["mae"],
   });
@@ -106,55 +69,57 @@ async function createAndTrainModel(features, labels) {
   console.log("Training model...");
   await model.fit(features, labels, { epochs: 50, batchSize: 32, validationSplit: 0.2 });
   console.log("Model training complete.");
-
   return model;
+}
+
+// Prepare input for prediction
+function prepareInput(params) {
+  const { speed, width } = params;
+  return tf.tensor2d([[speed, width]]);
 }
 
 // Main function
 (async () => {
-  const featuresList = [
-    "CME Average Speed",
-    "CME Final Speed",
-    "CME Angular Width",
-    "CME Mass",
-    "Solar Wind Bz",
-    "Solar Wind Speed",
-    "Solar Wind Temperature",
-    "Solar Wind Pressure",
-    "Solar Wind Longitude",
-    "Solar Wind He Proton Ratio",
-    "Solar Wind Bx",
-    "CME Position Angle",
-  ];
+  console.log("Fetching and preprocessing CME data...");
+  const { features, labels } = await fetchCMEData();
 
-  const time = "2015-12-28T12:12:00"; // CME Onset time
-  const width = 360; // Angular width
-  const speed = 1212; // Speed in km/s
-  const finalSpeed = 1243; // Final speed in km/s
-  const mass = 1.9e16; // CME mass
-  const mpa = 163; // Position angle
+  // Check if we have enough data
+  if (features.shape[0] === 0 || labels.shape[0] === 0) {
+    console.error("No data available for training. Exiting...");
+    return;
+  }
 
-  const wind = await readOmni(time, 6);
-  const info = { Speed: speed, Speed_final: finalSpeed, Width: width, Mass: mass, PA: mpa, Wind: wind };
+  // Normalize the data
+  const normalizedFeatures = normalize(features);
+  const normalizedLabels = normalize(labels);
 
-  // Prepare input
-  const xInput = getSvmInput(info, featuresList);
+  // Train the model
+  const model = await createAndTrainModel(normalizedFeatures, normalizedLabels);
 
-  // Generate synthetic training data
-  const syntheticFeatures = tf.randomNormal([100, featuresList.length]);
-  const syntheticLabels = tf.randomNormal([100, 1]);
+  // Example CME parameters for prediction
+  const cmeParams = {
+    speed: 1212, // Linear speed in km/s
+    width: 360,  // Angular width in degrees
+  };
 
-  // Train a new model
-  const model = await createAndTrainModel(syntheticFeatures, syntheticLabels);
+  // Prepare the input
+  const inputTensor = prepareInput(cmeParams);
 
-  // Make a prediction
-  const travelTimeTensor = model.predict(xInput);
-  const travelTime = travelTimeTensor.dataSync()[0];
+  // Make the prediction
+  const predictedTransitTime = model.predict(inputTensor).dataSync()[0];
 
-  // Calculate the predicted arrival time
-  const arrivalTime = moment(time).add(travelTime, "hours").format("YYYY-MM-DDTHH:mm:ss");
+  // Validate and calculate the arrival time
+  if (isNaN(predictedTransitTime) || predictedTransitTime <= 0) {
+    console.error("Invalid prediction:", predictedTransitTime);
+    return;
+  }
 
-  console.log(`CME with onset time ${time} UT`);
+  const cmeOnsetTime = "2015-12-28T12:12:00";
+  const arrivalTime = moment(cmeOnsetTime)
+    .add(predictedTransitTime, "hours")
+    .format("YYYY-MM-DDTHH:mm:ss");
+
+  console.log(`CME with onset time ${cmeOnsetTime} UT`);
   console.log(`Will hit the Earth at ${arrivalTime} UT`);
-  console.log(`With a transit time of ${travelTime.toFixed(2)} hours`);
+  console.log(`With a transit time of ${predictedTransitTime.toFixed(2)} hours`);
 })();
